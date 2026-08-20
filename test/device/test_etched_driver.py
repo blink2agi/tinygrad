@@ -1,9 +1,9 @@
-import hashlib, json, struct, tempfile, unittest
+import hashlib, json, os, struct, sys, tempfile, unittest
 from pathlib import Path
 
 from tinygrad.runtime.support.etched import (
-  EtchedFormatError, EtchedHardwareUnavailable, EtchedPublicSpecIncomplete, LinuxSohuTransport, PublicExecutable, PublicMatmulIR,
-  PythonEtchedDriver, SohuUringCommand, discover_sohu_devices,
+  EtchedFormatError, EtchedHardwareUnavailable, EtchedPublicSpecIncomplete, IoUringError, IoUringQueueFull, LinuxIoUring,
+  LinuxSohuTransport, PublicExecutable, PublicMatmulIR, PythonEtchedDriver, SohuUringCommand, discover_sohu_devices,
 )
 
 
@@ -256,6 +256,201 @@ class TestLinuxSohuTransport(unittest.TestCase):
         transport.submit(b"")
       with self.assertRaisesRegex(EtchedPublicSpecIncomplete, "cmd_op.*payload schema.*memory registration"):
         transport.submit(b"public-executable")
+
+
+class FakeUringSystem:
+  def __init__(self, result:int=0, *, complete:bool=True, valid_params:bool=True, fail_register:bool=False,
+               fail_unregister:bool=False, fail_map_offset:int|None=None):
+    self.result, self.complete, self.valid_params = result, complete, valid_params
+    self.fail_register, self.fail_unregister, self.fail_map_offset = fail_register, fail_unregister, fail_map_offset
+    self.ring:bytearray|None = None
+    self.sqes:bytearray|None = None
+    self.registered:tuple[int, ...]|None = None
+    self.enter_calls:list[tuple[int, int, int, int]] = []
+    self.unregister_count, self.closed_fd = 0, None
+
+  def setup(self, entries:int) -> tuple[int, bytes]:
+    params = bytearray(120 if self.valid_params else 12)
+    if not self.valid_params: return 91, bytes(params)
+    struct.pack_into("<II", params, 0, entries, entries)
+    struct.pack_into("<I", params, 20, 1)  # IORING_FEAT_SINGLE_MMAP
+    struct.pack_into("<IIIIIII", params, 40, 0, 4, 8, 12, 16, 20, 24)
+    struct.pack_into("<IIIIIII", params, 80, 64, 68, 72, 76, 80, 96, 84)
+    return 91, bytes(params)
+
+  def map(self, fd:int, size:int, offset:int):
+    self.assert_fd(fd)
+    if offset == self.fail_map_offset: raise OSError(12, "fake mmap failure")
+    if offset == 0:
+      self.ring = bytearray(size)
+      struct.pack_into("<II", self.ring, 8, 3, 4)
+      struct.pack_into("<II", self.ring, 72, 3, 4)
+      return self.ring
+    if offset == 0x10000000:
+      self.sqes = bytearray(size)
+      return self.sqes
+    raise AssertionError(f"unexpected mmap offset {offset:#x}")
+
+  @staticmethod
+  def assert_fd(fd:int):
+    if fd != 91: raise AssertionError(f"unexpected ring fd {fd}")
+
+  def register_files(self, fd:int, files:tuple[int, ...]):
+    self.assert_fd(fd)
+    if self.fail_register: raise OSError(22, "fake registration failure")
+    self.registered = files
+
+  def unregister_files(self, fd:int):
+    self.assert_fd(fd)
+    self.unregister_count += 1
+    if self.fail_unregister: raise OSError(5, "fake unregister failure")
+
+  def enter(self, fd:int, to_submit:int, min_complete:int, flags:int) -> int:
+    self.assert_fd(fd)
+    self.enter_calls.append((fd, to_submit, min_complete, flags))
+    if self.complete:
+      assert self.ring is not None and self.sqes is not None
+      sq_tail, sq_mask = struct.unpack_from("<II", self.ring, 4)[0], struct.unpack_from("<I", self.ring, 8)[0]
+      array_index = (sq_tail - 1) & sq_mask
+      sqe_index = struct.unpack_from("<I", self.ring, 24 + array_index * 4)[0]
+      user_data = struct.unpack_from("<Q", self.sqes, sqe_index * 64 + 32)[0]
+      cq_tail, cq_mask = struct.unpack_from("<I", self.ring, 68)[0], struct.unpack_from("<I", self.ring, 72)[0]
+      struct.pack_into("<QiI", self.ring, 96 + (cq_tail & cq_mask) * 16, user_data, self.result, 0xA5)
+      struct.pack_into("<I", self.ring, 68, cq_tail + 1)
+      struct.pack_into("<I", self.ring, 0, sq_tail)
+    return to_submit
+
+  def close_fd(self, fd:int):
+    self.assert_fd(fd)
+    self.closed_fd = fd
+
+
+class TestLinuxIoUring(unittest.TestCase):
+  def test_register_submit_complete_and_close(self):
+    system = FakeUringSystem()
+    with LinuxIoUring(entries=4, system=system) as ring:
+      ring.register_files((37,))
+      command = SohuUringCommand(fd=0, cmd_op=9, addr=0x12340000, length=128, user_data=0xCAFE)
+      completion = ring.submit_sqe(command.to_sqe())
+      self.assertEqual((completion.user_data, completion.result, completion.flags), (0xCAFE, 0, 0xA5))
+      self.assertEqual(system.registered, (37,))
+      self.assertEqual(system.enter_calls, [(91, 1, 1, 1)])
+      assert system.sqes is not None
+      self.assertEqual(bytes(system.sqes[:64]), command.to_sqe())
+    self.assertEqual((system.unregister_count, system.closed_fd), (1, 91))
+
+  def test_returns_negative_device_completion(self):
+    with LinuxIoUring(entries=4, system=FakeUringSystem(result=-5)) as ring:
+      completion = ring.submit_sqe(SohuUringCommand(fd=4, cmd_op=1, addr=2, length=3, fixed_file=False).to_sqe())
+      self.assertEqual(completion.result, -5)
+
+  def test_rejects_full_ring_bad_sqe_and_missing_completion(self):
+    system = FakeUringSystem()
+    with LinuxIoUring(entries=4, system=system) as ring:
+      with self.assertRaisesRegex(ValueError, "64 bytes"): ring.submit_sqe(b"short")
+      assert system.ring is not None
+      struct.pack_into("<II", system.ring, 0, 0, 4)
+      with self.assertRaises(IoUringQueueFull): ring.submit_sqe(bytes(64))
+
+    with LinuxIoUring(entries=4, system=FakeUringSystem(complete=False)) as ring:
+      with self.assertRaisesRegex(IoUringError, "completion"):
+        ring.submit_sqe(SohuUringCommand(fd=4, cmd_op=1, addr=2, length=3, fixed_file=False).to_sqe())
+
+  def test_invalid_kernel_layout_closes_ring_fd(self):
+    system = FakeUringSystem(valid_params=False)
+    with self.assertRaisesRegex(IoUringError, "parameter"):
+      LinuxIoUring(entries=4, system=system)
+    self.assertEqual(system.closed_fd, 91)
+
+  def test_mapping_and_unregister_failures_still_close_ring_fd(self):
+    mapping_failure = FakeUringSystem(fail_map_offset=0x10000000)
+    with self.assertRaisesRegex(OSError, "mmap"):
+      LinuxIoUring(entries=4, system=mapping_failure)
+    self.assertEqual(mapping_failure.closed_fd, 91)
+
+    unregister_failure = FakeUringSystem(fail_unregister=True)
+    ring = LinuxIoUring(entries=4, system=unregister_failure)
+    ring.register_files((37,))
+    with self.assertRaisesRegex(OSError, "unregister"):
+      ring.close()
+    self.assertEqual(unregister_failure.closed_fd, 91)
+
+  @unittest.skipUnless(sys.platform.startswith("linux"), "requires a Linux io_uring kernel")
+  def test_real_linux_nop(self):
+    try:
+      with LinuxIoUring(entries=2) as ring:
+        sqe = bytearray(64)
+        struct.pack_into("<Q", sqe, 32, 0x1234)
+        self.assertEqual(ring.submit_sqe(bytes(sqe)).result, 0)
+    except OSError as exc:
+      if exc.errno in (1, 13, 38): self.skipTest(f"io_uring unavailable in this Linux sandbox: {exc}")
+      raise
+
+
+class TestLinuxSohuRawSubmission(unittest.TestCase):
+  def test_explicit_raw_command_uses_registered_device_and_completion(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      root = Path(tmp)
+      TestSohuDiscovery.add_pci_device(root, "0000:03:00.0", "0x20a1", "0x0001")
+      node = root / "sohu0"
+      node.touch()
+      system, closed = FakeUringSystem(), []
+      transport = LinuxSohuTransport(node, sysfs_root=root, platform="linux",
+                                     ring_factory=lambda: LinuxIoUring(entries=4, system=system),
+                                     device_opener=lambda path: 37, device_closer=closed.append)
+      completion = transport.submit_raw(cmd_op=0x44, payload=b"abc", user_data=0x55)
+      self.assertEqual((completion.user_data, completion.result), (0x55, 0))
+      self.assertEqual(system.registered, (37,))
+      assert system.sqes is not None
+      self.assertEqual(struct.unpack_from("<I", system.sqes, 8)[0], 0x44)
+      self.assertNotEqual(struct.unpack_from("<Q", system.sqes, 16)[0], 0)
+      self.assertEqual(struct.unpack_from("<I", system.sqes, 24)[0], 3)
+      transport.close()
+      self.assertEqual(closed, [37])
+
+  def test_negative_raw_completion_becomes_oserror(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      root = Path(tmp)
+      TestSohuDiscovery.add_pci_device(root, "0000:03:00.0", "0x20a1", "0x0001")
+      node = root / "sohu0"
+      node.touch()
+      transport = LinuxSohuTransport(node, sysfs_root=root, platform="linux",
+                                     ring_factory=lambda: LinuxIoUring(entries=4, system=FakeUringSystem(result=-5)),
+                                     device_opener=lambda path: 37, device_closer=lambda fd: None)
+      with self.assertRaisesRegex(OSError, os.strerror(5)):
+        transport.submit_raw(cmd_op=1, payload=b"x")
+      transport.close()
+
+  def test_registration_failure_closes_ring_and_device_fds(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      root = Path(tmp)
+      TestSohuDiscovery.add_pci_device(root, "0000:03:00.0", "0x20a1", "0x0001")
+      node = root / "sohu0"
+      node.touch()
+      system, closed, rings = FakeUringSystem(fail_register=True), [], []
+      def make_ring():
+        rings.append(ring:=LinuxIoUring(entries=4, system=system))
+        return ring
+      transport = LinuxSohuTransport(node, sysfs_root=root, platform="linux",
+                                     ring_factory=make_ring,
+                                     device_opener=lambda path: 37, device_closer=closed.append)
+      with self.assertRaisesRegex(OSError, "registration"):
+        transport.submit_raw(cmd_op=1, payload=b"x")
+      self.assertEqual((system.closed_fd, closed), (91, [37]))
+
+  def test_unconfirmed_payload_remains_pinned_until_transport_close(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      root = Path(tmp)
+      TestSohuDiscovery.add_pci_device(root, "0000:03:00.0", "0x20a1", "0x0001")
+      node = root / "sohu0"
+      node.touch()
+      transport = LinuxSohuTransport(node, sysfs_root=root, platform="linux",
+                                     ring_factory=lambda: LinuxIoUring(entries=4, system=FakeUringSystem(complete=False)),
+                                     device_opener=lambda path: 37, device_closer=lambda fd: None)
+      with self.assertRaises(IoUringError): transport.submit_raw(cmd_op=1, payload=b"still-in-flight")
+      self.assertEqual(transport.pending_payload_count, 1)
+      transport.close()
+      self.assertEqual(transport.pending_payload_count, 0)
 
 
 if __name__ == "__main__": unittest.main()

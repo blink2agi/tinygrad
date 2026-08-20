@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
-import hashlib, hmac, itertools, json, struct, sys, threading
+import contextlib, ctypes, hashlib, hmac, itertools, json, mmap, os, platform, struct, sys, threading
 
 
 PUBLIC_IR_VERSION = 1
@@ -31,6 +31,14 @@ class EtchedHardwareUnavailable(RuntimeError):
 
 class EtchedPublicSpecIncomplete(RuntimeError):
   """Raised instead of guessing a silicon ABI that Etched has not published."""
+
+
+class IoUringError(RuntimeError):
+  """Raised when the Linux io_uring state or completion stream is invalid."""
+
+
+class IoUringQueueFull(IoUringError):
+  """Raised when no submission-queue entry is available."""
 
 
 def _plain_json(value:Any) -> Any:
@@ -331,6 +339,16 @@ SOHU_PCI_VENDOR_ID = 0x20A1
 SOHU_PCI_DEVICE_ID = 0x0001
 IORING_OP_URING_CMD = 46
 IOSQE_FIXED_FILE = 1
+IORING_OFF_SQ_RING = 0
+IORING_OFF_CQ_RING = 0x08000000
+IORING_OFF_SQES = 0x10000000
+IORING_ENTER_GETEVENTS = 1
+IORING_FEAT_SINGLE_MMAP = 1
+IORING_REGISTER_FILES = 2
+IORING_UNREGISTER_FILES = 3
+NR_IO_URING_SETUP = 425
+NR_IO_URING_ENTER = 426
+NR_IO_URING_REGISTER = 427
 
 
 @dataclass(frozen=True)
@@ -388,14 +406,192 @@ class SohuUringCommand:
     return bytes(sqe)
 
 
+@dataclass(frozen=True)
+class IoUringCompletion:
+  user_data:int
+  result:int
+  flags:int
+
+
+@dataclass(frozen=True)
+class _IoUringLayout:
+  sq_entries:int
+  cq_entries:int
+  features:int
+  sq_head:int
+  sq_tail:int
+  sq_mask:int
+  sq_ring_entries:int
+  sq_flags:int
+  sq_dropped:int
+  sq_array:int
+  cq_head:int
+  cq_tail:int
+  cq_mask:int
+  cq_ring_entries:int
+  cq_overflow:int
+  cq_cqes:int
+  cq_flags:int
+
+  @classmethod
+  def from_params(cls, params:bytes) -> _IoUringLayout:
+    if len(params) < 120: raise IoUringError(f"io_uring parameter block is {len(params)} bytes, expected at least 120")
+    sq_entries, cq_entries, _, _, _, features = struct.unpack_from("<IIIIII", params)
+    sq_offsets = struct.unpack_from("<IIIIIII", params, 40)
+    cq_offsets = struct.unpack_from("<IIIIIII", params, 80)
+    if sq_entries <= 0 or cq_entries <= 0 or sq_entries & (sq_entries-1) or cq_entries & (cq_entries-1):
+      raise IoUringError("kernel returned non-power-of-two io_uring entry counts")
+    if any(offset >= 1 << 30 for offset in (*sq_offsets, *cq_offsets)):
+      raise IoUringError("kernel returned unreasonable io_uring offsets")
+    return cls(sq_entries, cq_entries, features, *sq_offsets, *cq_offsets)
+
+  @property
+  def sq_ring_size(self) -> int: return self.sq_array + self.sq_entries * 4
+
+  @property
+  def cq_ring_size(self) -> int: return self.cq_cqes + self.cq_entries * 16
+
+
+class _LinuxUringSystem:
+  def __init__(self):
+    if platform.system() != "Linux": raise EtchedHardwareUnavailable("raw io_uring requires Linux")
+    self.libc:Any = ctypes.CDLL(None, use_errno=True)
+    self.libc.syscall.restype = ctypes.c_long
+
+  def _call(self, name:str, number:int, *args) -> int:
+    ctypes.set_errno(0)
+    converted = [ctypes.c_long(arg) if isinstance(arg, int) else arg for arg in args]
+    result = int(self.libc.syscall(ctypes.c_long(number), *converted))
+    if result == -1:
+      error = ctypes.get_errno()
+      raise OSError(error, f"{name}: {os.strerror(error)}")
+    return result
+
+  def setup(self, entries:int) -> tuple[int, bytes]:
+    params = ctypes.create_string_buffer(120)
+    fd = self._call("io_uring_setup", NR_IO_URING_SETUP, entries, ctypes.byref(params))
+    return fd, params.raw
+
+  def map(self, fd:int, size:int, offset:int):
+    return mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=offset)
+
+  def register_files(self, fd:int, files:tuple[int, ...]):
+    values = (ctypes.c_int32 * len(files))(*files)
+    self._call("io_uring_register(files)", NR_IO_URING_REGISTER, fd, IORING_REGISTER_FILES, ctypes.byref(values), len(files))
+
+  def unregister_files(self, fd:int):
+    self._call("io_uring_unregister(files)", NR_IO_URING_REGISTER, fd, IORING_UNREGISTER_FILES, 0, 0)
+
+  def enter(self, fd:int, to_submit:int, min_complete:int, flags:int) -> int:
+    return self._call("io_uring_enter", NR_IO_URING_ENTER, fd, to_submit, min_complete, flags, 0, 0)
+
+  @staticmethod
+  def close_fd(fd:int): os.close(fd)
+
+
+class LinuxIoUring:
+  """Minimal 100% Python Linux io_uring queue with synchronous completions."""
+  def __init__(self, entries:int=8, *, system:Any=None):
+    _uint("io_uring entries", entries, 15, nonzero=True)
+    self._system, self._lock = _LinuxUringSystem() if system is None else system, threading.RLock()
+    self._ring_fd:int
+    self._ring_fd, params = self._system.setup(entries)
+    self._sq_ring = self._cq_ring = self._sqes = None
+    self._registered_files = False
+    self._closed = True
+    try:
+      self._layout = _IoUringLayout.from_params(params)
+      if self._layout.features & IORING_FEAT_SINGLE_MMAP:
+        self._sq_ring = self._cq_ring = self._system.map(self._ring_fd, max(self._layout.sq_ring_size, self._layout.cq_ring_size),
+                                                         IORING_OFF_SQ_RING)
+      else:
+        self._sq_ring = self._system.map(self._ring_fd, self._layout.sq_ring_size, IORING_OFF_SQ_RING)
+        self._cq_ring = self._system.map(self._ring_fd, self._layout.cq_ring_size, IORING_OFF_CQ_RING)
+      self._sqes = self._system.map(self._ring_fd, self._layout.sq_entries * 64, IORING_OFF_SQES)
+      self._closed = False
+    except Exception:
+      self._close_resources()
+      raise
+
+  def _ensure_open(self):
+    if self._closed: raise IoUringError("io_uring is closed")
+
+  def register_files(self, files:tuple[int, ...]):
+    self._ensure_open()
+    if self._registered_files: raise IoUringError("io_uring files are already registered")
+    if not files: raise ValueError("at least one file descriptor is required")
+    for fd in files:
+      _sint("registered file descriptor", fd, 32)
+      if fd < 0: raise ValueError("registered file descriptors must be nonnegative")
+    self._system.register_files(self._ring_fd, files)
+    self._registered_files = True
+
+  def submit_sqe(self, sqe:bytes) -> IoUringCompletion:
+    self._ensure_open()
+    if not isinstance(sqe, bytes) or len(sqe) != 64: raise ValueError("io_uring SQE must be exactly 64 bytes")
+    with self._lock:
+      assert self._sq_ring is not None and self._cq_ring is not None and self._sqes is not None
+      head, tail = struct.unpack_from("<I", self._sq_ring, self._layout.sq_head)[0], struct.unpack_from("<I", self._sq_ring, self._layout.sq_tail)[0]
+      mask = struct.unpack_from("<I", self._sq_ring, self._layout.sq_mask)[0]
+      ring_entries = struct.unpack_from("<I", self._sq_ring, self._layout.sq_ring_entries)[0]
+      if ring_entries != self._layout.sq_entries or ((tail-head) & 0xFFFFFFFF) >= ring_entries:
+        raise IoUringQueueFull("io_uring submission queue is full or inconsistent")
+      sqe_index = tail & mask
+      if sqe_index >= self._layout.sq_entries: raise IoUringError("io_uring submission mask produced an invalid index")
+      self._sqes[sqe_index*64:(sqe_index+1)*64] = sqe
+      struct.pack_into("<I", self._sq_ring, self._layout.sq_array + (tail & mask)*4, sqe_index)
+      struct.pack_into("<I", self._sq_ring, self._layout.sq_tail, (tail+1) & 0xFFFFFFFF)
+      if self._system.enter(self._ring_fd, 1, 1, IORING_ENTER_GETEVENTS) < 1: raise IoUringError("io_uring submitted no entries")
+
+      cq_head = struct.unpack_from("<I", self._cq_ring, self._layout.cq_head)[0]
+      cq_tail = struct.unpack_from("<I", self._cq_ring, self._layout.cq_tail)[0]
+      if cq_head == cq_tail: raise IoUringError("io_uring returned without a completion")
+      cq_mask = struct.unpack_from("<I", self._cq_ring, self._layout.cq_mask)[0]
+      cqe_offset = self._layout.cq_cqes + (cq_head & cq_mask) * 16
+      user_data, result, flags = struct.unpack_from("<QiI", self._cq_ring, cqe_offset)
+      struct.pack_into("<I", self._cq_ring, self._layout.cq_head, (cq_head+1) & 0xFFFFFFFF)
+      if user_data != struct.unpack_from("<Q", sqe, 32)[0]: raise IoUringError("io_uring completion user_data does not match submission")
+      return IoUringCompletion(user_data, result, flags)
+
+  @staticmethod
+  def _close_mapping(mapping:Any):
+    if mapping is not None and hasattr(mapping, "close"): mapping.close()
+
+  def _close_resources(self):
+    mappings = {id(mapping):mapping for mapping in (self._sqes, self._cq_ring, self._sq_ring) if mapping is not None}
+    for mapping in mappings.values():
+      with contextlib.suppress(Exception): self._close_mapping(mapping)
+    if hasattr(self, "_ring_fd"):
+      with contextlib.suppress(Exception): self._system.close_fd(self._ring_fd)
+
+  def close(self):
+    if self._closed: return
+    with self._lock:
+      error:BaseException|None = None
+      try:
+        if self._registered_files: self._system.unregister_files(self._ring_fd)
+      except BaseException as exc: error = exc
+      finally:
+        self._registered_files = False
+        self._closed = True
+        self._close_resources()
+      if error is not None: raise error
+
+  def __enter__(self) -> LinuxIoUring: return self
+  def __exit__(self, *_): self.close()
+  def __del__(self):
+    with contextlib.suppress(Exception): self.close()
+
+
 class LinuxSohuTransport:
   """Fail-closed physical transport boundary based only on public information.
 
   Construction proves the host and PCI identity are plausible. Submission is
   deliberately blocked until Etched publishes the device command contract.
   """
-  def __init__(self, device_node:Path|str, *, sysfs_root:Path|str=Path("/sys/bus/pci/devices"),
-               platform:str|None=None, bdf:str|None=None):
+  def __init__(self, device_node:Path|str, *, sysfs_root:Path|str=Path("/sys/bus/pci/devices"), platform:str|None=None,
+               bdf:str|None=None, ring_factory:Callable[[], LinuxIoUring]|None=None, device_opener:Callable[[Path], int]|None=None,
+               device_closer:Callable[[int], None]|None=None):
     active_platform = sys.platform if platform is None else platform
     if not active_platform.startswith("linux"): raise EtchedHardwareUnavailable("physical Sohu transport requires Linux")
     devices = discover_sohu_devices(sysfs_root)
@@ -406,9 +602,62 @@ class LinuxSohuTransport:
     self.device_node = Path(device_node)
     if not self.device_node.exists() or self.device_node.is_dir():
       raise EtchedHardwareUnavailable(f"Sohu device node {self.device_node} does not exist")
+    self._ring_factory = LinuxIoUring if ring_factory is None else ring_factory
+    self._device_opener = (lambda path: os.open(path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))) if device_opener is None else device_opener
+    self._device_closer = os.close if device_closer is None else device_closer
+    self._ring:LinuxIoUring|None = None
+    self._device_fd:int|None = None
+    self._pending_payloads:list[Any] = []
+    self._lock = threading.RLock()
+
+  @property
+  def pending_payload_count(self) -> int:
+    with self._lock: return len(self._pending_payloads)
 
   def submit(self, payload:bytes):
     if not isinstance(payload, bytes): raise TypeError("Sohu command payload must be bytes")
     if not payload: raise ValueError("Sohu command payload must be nonempty")
     raise EtchedPublicSpecIncomplete("Etched has not published Sohu cmd_op values, payload schema, memory registration UAPI, "
                                      "firmware handshake, or completion semantics; refusing to guess the physical ABI")
+
+  def submit_raw(self, cmd_op:int, payload:bytes, *, user_data:int=0) -> IoUringCompletion:
+    """Submit an explicitly supplied vendor command without inventing a Sohu ABI."""
+    if not isinstance(payload, bytes): raise TypeError("Sohu command payload must be bytes")
+    if not payload: raise ValueError("Sohu command payload must be nonempty")
+    _uint("cmd_op", cmd_op, 32)
+    _uint("user_data", user_data, 64)
+    with self._lock:
+      if self._ring is None:
+        device_fd = self._device_opener(self.device_node)
+        ring:LinuxIoUring|None = None
+        try:
+          ring = self._ring_factory()
+          ring.register_files((device_fd,))
+        except Exception:
+          if ring is not None:
+            with contextlib.suppress(Exception): ring.close()
+          self._device_closer(device_fd)
+          raise
+        self._device_fd, self._ring = device_fd, ring
+      payload_buffer = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
+      self._pending_payloads.append(payload_buffer)
+      command = SohuUringCommand(0, cmd_op, ctypes.addressof(payload_buffer), len(payload), user_data=user_data)
+      completion = self._ring.submit_sqe(command.to_sqe())
+      self._pending_payloads.pop()
+      if completion.result < 0: raise OSError(-completion.result, os.strerror(-completion.result))
+      return completion
+
+  def close(self):
+    with self._lock:
+      ring, device_fd = self._ring, self._device_fd
+      self._ring, self._device_fd = None, None
+      try:
+        if ring is not None: ring.close()
+      finally:
+        if device_fd is not None: self._device_closer(device_fd)
+        self._pending_payloads.clear()
+
+  def __enter__(self) -> LinuxSohuTransport: return self
+  def __exit__(self, *_): self.close()
+  def __del__(self):
+    with contextlib.suppress(Exception): self.close()

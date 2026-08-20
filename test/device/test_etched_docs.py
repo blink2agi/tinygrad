@@ -11,7 +11,7 @@ class TestEtchedDocumentation(unittest.TestCase):
     required = [
       "DEV=ETCHED python3 examples/etched_demo.py", "20a1:0001", "IORING_OP_URING_CMD", "cmd_op", "payload schema",
       "memory registration", "does not claim physical A0 execution", "wc -l", "aa7d43725fbf828d11fdab4356c8be90021cb6c9",
-      "US20250138820A1", "US20250156164A1",
+      "US20250138820A1", "US20250156164A1", "LinuxIoUring", "io_uring_setup", "submit_raw",
     ]
     for text in required:
       with self.subTest(text=text): self.assertIn(text, documentation)

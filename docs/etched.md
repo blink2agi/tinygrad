@@ -33,6 +33,7 @@ DEV=ETCHED python3 -m pytest -q test/test_tiny.py
 | Public semantic IR | Canonical patent-field matmul record | Working |
 | PCI discovery | Linux sysfs identity `20a1:0001` | Working and fixture-tested |
 | Linux command encoding | 64-byte `IORING_OP_URING_CMD` SQE matching Etched's public builder | Working and byte-tested |
+| Raw Linux host queue | `io_uring_setup`/mmap/register/enter/CQE in 100% Python | Working; fake-kernel tested |
 | Sohu A0 command submission | Vendor `cmd_op` and payload ABI | Awaiting Etched disclosure |
 
 The default is the portable reference device. It does not report software execution as Sohu execution.
@@ -86,7 +87,8 @@ Addresses, dimensions, flags, section keys, versions, and canonical serializatio
 - serialized submissions and monotonically increasing sequence IDs;
 - immutable submission, completion, and trace snapshots;
 - exception-to-failed-completion propagation;
-- deterministic synchronization.
+- deterministic synchronization;
+- raw Linux `io_uring` setup, shared-ring mapping, fixed-file registration, SQE queueing, submission, and CQE decoding.
 
 The software device is synchronous internally, which makes test results deterministic, while submission and completion remain separate records to preserve the physical-device boundary.
 
@@ -112,9 +114,19 @@ Etched's public `io-uring` commit adds `SohuSendCmd` with these assignments:
 | `len` | 24 | unsigned 32-bit |
 | `user_data` | 32 | unsigned 64-bit |
 
-`discover_sohu_devices()` scans `/sys/bus/pci/devices` and selects only the public Etched Sohu PCI identity `20a1:0001`. `LinuxSohuTransport` then validates Linux, PCI discovery, selection, and the device node.
+`LinuxIoUring` is the actual 100% Python host queue, not only an encoder. Using `ctypes`, `mmap`, and the Linux UAPI already carried by Tinygrad, it:
 
-The transport fails closed before physical submission because these public inputs are still absent:
+1. calls `io_uring_setup` and validates the kernel's 120-byte parameter block;
+2. maps the submission ring, completion ring, and SQE array, including `IORING_FEAT_SINGLE_MMAP`;
+3. registers the Sohu device descriptor as a fixed file;
+4. publishes a 64-byte SQE, calls `io_uring_enter`, waits for a CQE, and checks `user_data` correlation;
+5. returns signed device results and always closes mappings, registered files, and ring descriptors on success or failure.
+
+The state machine is exercised against a fake kernel that reads the published SQE and writes a real-layout CQE. A Linux-only `IORING_OP_NOP` test is included for execution on a Linux kernel; this macOS development host cannot run that syscall.
+
+`discover_sohu_devices()` scans `/sys/bus/pci/devices` and selects only the public Etched Sohu PCI identity `20a1:0001`. `LinuxSohuTransport` then validates Linux, PCI discovery, selection, and the device node. Its explicit `submit_raw(cmd_op, payload)` path opens the node, registers it in `LinuxIoUring`, pins the Python payload across DMA, submits `SohuSendCmd`, waits for completion, and converts negative CQE results to `OSError`.
+
+The ordinary `submit()` path still fails closed instead of choosing a vendor command on the caller's behalf, because these public inputs are absent:
 
 1. the valid Sohu `cmd_op` values;
 2. the command payload schema and executable payload format;
@@ -124,7 +136,7 @@ The transport fails closed before physical submission because these public input
 6. completion result and error semantics;
 7. one A0 conformance vector.
 
-Guessing any of these could DMA from the wrong address or submit a structurally valid command with destructive meaning. The ordinary path raises `EtchedPublicSpecIncomplete` until Etched supplies the contract.
+Guessing any of these could DMA from the wrong address or submit a structurally valid command with destructive meaning. The ordinary path raises `EtchedPublicSpecIncomplete` until Etched supplies the contract. `submit_raw` accepts an explicit `cmd_op` and payload for an Etched engineer or hardware owner; the implementation assigns no guessed values.
 
 ## What Etched needs to provide for A0 bring-up
 
@@ -140,7 +152,7 @@ completion status table
 one input executable + buffers + expected completion/output
 ```
 
-With those items, `LinuxSohuTransport.submit()` can replace its fail-closed exception with an `io_uring` queue/enter/completion call and be tested against the conformance vector. No Tensor API or compiler/runtime ownership boundary needs to change.
+With those items, a typed `LinuxSohuTransport.submit()` can wrap the already-implemented `submit_raw` path and be tested against the conformance vector. No Tensor API, ring implementation, or compiler/runtime ownership boundary needs to change.
 
 ## Verification
 
