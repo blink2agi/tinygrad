@@ -122,7 +122,7 @@ Etched's public `io-uring` commit adds `SohuSendCmd` with these assignments:
 4. publishes a 64-byte SQE, calls `io_uring_enter`, waits for a CQE, and checks `user_data` correlation;
 5. returns signed device results and always closes mappings, registered files, and ring descriptors on success or failure.
 
-The state machine is exercised against a fake kernel that reads the published SQE and writes a real-layout CQE. A Linux-only `IORING_OP_NOP` test is included for execution on a Linux kernel; this macOS development host cannot run that syscall.
+The state machine is exercised against a fake kernel that reads the published SQE and writes a real-layout CQE. The Linux-only test was also executed in an ARM64 Alpine Linux 6.18.35 VM: it performed actual fixed-file registration and 257 `IORING_OP_NOP` submissions/completions to exercise ring wraparound, then unregistered and closed cleanly.
 
 `discover_sohu_devices()` scans `/sys/bus/pci/devices` and selects only the public Etched Sohu PCI identity `20a1:0001`. `LinuxSohuTransport` then validates Linux, PCI discovery, selection, and the device node. Its explicit `submit_raw(cmd_op, payload)` path opens the node, registers it in `LinuxIoUring`, pins the Python payload across DMA, submits `SohuSendCmd`, waits for completion, and converts negative CQE results to `OSError`.
 
@@ -187,6 +187,7 @@ The final submission report also counts all added Python, tests, examples, notic
 
 - [SemiAnalysis bounty post](https://x.com/SemiAnalysis_/status/2090287730605355069)
 - [Etched's `SohuSendCmd` commit (`aa7d43725fbf828d11fdab4356c8be90021cb6c9`)](https://github.com/etched-ai/io-uring/commit/aa7d43725fbf828d11fdab4356c8be90021cb6c9)
+- [Etched's public CSR generator, whose templates reference the unpublished `fw/soc/sohu/sohu_chip_csr.h`](https://github.com/etched-ai/etched-peakrdl)
 - [Etched public IR patent application US20250138820A1](https://patents.google.com/patent/US20250138820A1/en)
 - [Etched public template patent application US20250156164A1](https://patents.google.com/patent/US20250156164A1/en)
 - [Etched progress update describing Sohu A0](https://www.etched.com/progress/frontier-inference-clusters)

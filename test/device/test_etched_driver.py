@@ -377,14 +377,19 @@ class TestLinuxIoUring(unittest.TestCase):
 
   @unittest.skipUnless(sys.platform.startswith("linux"), "requires a Linux io_uring kernel")
   def test_real_linux_nop(self):
+    device_fd = os.open("/dev/null", os.O_RDONLY)
     try:
       with LinuxIoUring(entries=2) as ring:
-        sqe = bytearray(64)
-        struct.pack_into("<Q", sqe, 32, 0x1234)
-        self.assertEqual(ring.submit_sqe(bytes(sqe)).result, 0)
+        ring.register_files((device_fd,))
+        for sequence in range(1, 258):
+          sqe = bytearray(64)
+          struct.pack_into("<Q", sqe, 32, sequence)
+          completion = ring.submit_sqe(bytes(sqe))
+          self.assertEqual((completion.user_data, completion.result), (sequence, 0))
     except OSError as exc:
       if exc.errno in (1, 13, 38): self.skipTest(f"io_uring unavailable in this Linux sandbox: {exc}")
       raise
+    finally: os.close(device_fd)
 
 
 class TestLinuxSohuRawSubmission(unittest.TestCase):
