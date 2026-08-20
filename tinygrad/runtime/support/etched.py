@@ -6,8 +6,9 @@ information from the unpublished Sohu silicon ABI. It contains no Etched SDK cod
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Mapping
-import hashlib, hmac, itertools, json, struct, threading
+import hashlib, hmac, itertools, json, struct, sys, threading
 
 
 PUBLIC_IR_VERSION = 1
@@ -22,6 +23,14 @@ class EtchedFormatError(ValueError):
   """Raised when a public Etched record is malformed or unsupported."""
 
 
+class EtchedHardwareUnavailable(RuntimeError):
+  """Raised when the requested physical Sohu transport cannot be opened."""
+
+
+class EtchedPublicSpecIncomplete(RuntimeError):
+  """Raised instead of guessing a silicon ABI that Etched has not published."""
+
+
 def _canonical_json(value:Any) -> bytes:
   try: return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
   except (TypeError, ValueError) as exc: raise EtchedFormatError(f"value is not canonical JSON: {exc}") from exc
@@ -31,6 +40,13 @@ def _uint(name:str, value:Any, bits:int, *, nonzero:bool=False) -> int:
   if isinstance(value, bool) or not isinstance(value, int): raise TypeError(f"{name} must be an integer")
   minimum = 1 if nonzero else 0
   if not minimum <= value < 1 << bits: raise ValueError(f"{name} must be in [{minimum}, {(1 << bits) - 1}]")
+  return value
+
+
+def _sint(name:str, value:Any, bits:int) -> int:
+  if isinstance(value, bool) or not isinstance(value, int): raise TypeError(f"{name} must be an integer")
+  if not -(1 << (bits-1)) <= value < 1 << (bits-1):
+    raise ValueError(f"{name} must fit in a signed {bits}-bit integer")
   return value
 
 
@@ -299,3 +315,90 @@ class PythonEtchedDriver:
     with self._lock:
       if self._pending: raise RuntimeError(f"reference driver has pending submissions: {sorted(self._pending)}")
       return self._completions[-1].sequence if self._completions else 0
+
+
+SOHU_PCI_VENDOR_ID = 0x20A1
+SOHU_PCI_DEVICE_ID = 0x0001
+IORING_OP_URING_CMD = 46
+IOSQE_FIXED_FILE = 1
+
+
+@dataclass(frozen=True)
+class SohuPciDevice:
+  bdf:str
+  sysfs_path:Path
+  vendor_id:int = SOHU_PCI_VENDOR_ID
+  device_id:int = SOHU_PCI_DEVICE_ID
+
+
+def discover_sohu_devices(sysfs_root:Path|str=Path("/sys/bus/pci/devices")) -> tuple[SohuPciDevice, ...]:
+  """Discover public PCI identity 20a1:0001 without requiring a vendor library."""
+  root = Path(sysfs_root)
+  try: candidates = sorted(root.iterdir(), key=lambda path:path.name)
+  except OSError: return ()
+  found:list[SohuPciDevice] = []
+  for path in candidates:
+    try: vendor, device = int((path / "vendor").read_text().strip(), 0), int((path / "device").read_text().strip(), 0)
+    except (OSError, ValueError): continue
+    if (vendor, device) == (SOHU_PCI_VENDOR_ID, SOHU_PCI_DEVICE_ID): found.append(SohuPciDevice(path.name, path))
+  return tuple(found)
+
+
+@dataclass(frozen=True)
+class SohuUringCommand:
+  """Etched's publicly committed `SohuSendCmd` mapped onto Linux `io_uring_sqe`.
+
+  Field offsets follow Linux's 64-byte SQE. `fixed_file=True` models the fixed
+  descriptor form accepted by the public Rust builder.
+  """
+  fd:int
+  cmd_op:int
+  addr:int
+  length:int
+  user_data:int = 0
+  fixed_file:bool = True
+
+  def __post_init__(self):
+    _sint("fd", self.fd, 32)
+    _uint("cmd_op", self.cmd_op, 32)
+    _uint("addr", self.addr, 64)
+    _uint("length", self.length, 32, nonzero=True)
+    _uint("user_data", self.user_data, 64)
+    _flag("fixed_file", self.fixed_file)
+
+  def to_sqe(self) -> bytes:
+    sqe = bytearray(64)
+    struct.pack_into("<B", sqe, 0, IORING_OP_URING_CMD)
+    struct.pack_into("<B", sqe, 1, IOSQE_FIXED_FILE if self.fixed_file else 0)
+    struct.pack_into("<i", sqe, 4, self.fd)
+    struct.pack_into("<I", sqe, 8, self.cmd_op)
+    struct.pack_into("<Q", sqe, 16, self.addr)
+    struct.pack_into("<I", sqe, 24, self.length)
+    struct.pack_into("<Q", sqe, 32, self.user_data)
+    return bytes(sqe)
+
+
+class LinuxSohuTransport:
+  """Fail-closed physical transport boundary based only on public information.
+
+  Construction proves the host and PCI identity are plausible. Submission is
+  deliberately blocked until Etched publishes the device command contract.
+  """
+  def __init__(self, device_node:Path|str, *, sysfs_root:Path|str=Path("/sys/bus/pci/devices"),
+               platform:str|None=None, bdf:str|None=None):
+    active_platform = sys.platform if platform is None else platform
+    if not active_platform.startswith("linux"): raise EtchedHardwareUnavailable("physical Sohu transport requires Linux")
+    devices = discover_sohu_devices(sysfs_root)
+    if not devices: raise EtchedHardwareUnavailable("no Etched Sohu PCI device 20a1:0001 was found")
+    matching = [device for device in devices if bdf is None or device.bdf == bdf]
+    if not matching: raise EtchedHardwareUnavailable(f"Sohu PCI device {bdf!r} was not found")
+    self.device = matching[0]
+    self.device_node = Path(device_node)
+    if not self.device_node.exists() or self.device_node.is_dir():
+      raise EtchedHardwareUnavailable(f"Sohu device node {self.device_node} does not exist")
+
+  def submit(self, payload:bytes):
+    if not isinstance(payload, bytes): raise TypeError("Sohu command payload must be bytes")
+    if not payload: raise ValueError("Sohu command payload must be nonempty")
+    raise EtchedPublicSpecIncomplete("Etched has not published Sohu cmd_op values, payload schema, memory registration UAPI, "
+                                     "firmware handshake, or completion semantics; refusing to guess the physical ABI")
