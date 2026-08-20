@@ -66,6 +66,7 @@ class TestEtchedProgram(unittest.TestCase):
 class TestEtchedDevice(unittest.TestCase):
   def test_device_is_discoverable_by_tinygrad(self):
     self.assertIn("ETCHED", ALL_DEVICES)
+    self.assertLess(ALL_DEVICES.index("CPU"), ALL_DEVICES.index("ETCHED"), "reference backend must not displace the CPU default")
     self.assertIsInstance(Device["ETCHED"], EtchedDevice)
     self.assertEqual(Device["ETCHED"].renderer.target.device, "ETCHED")
 

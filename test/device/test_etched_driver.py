@@ -57,6 +57,11 @@ class TestPublicExecutable(unittest.TestCase):
       with self.subTest(metadata=metadata), self.assertRaises((EtchedFormatError, TypeError, ValueError)):
         PublicExecutable(metadata, b"payload")
 
+  def test_metadata_is_deeply_immutable(self):
+    executable = PublicExecutable(self.metadata, b"payload")
+    with self.assertRaises(TypeError): executable.metadata["uop_count"] = 4  # type: ignore[index]
+    with self.assertRaises(TypeError): executable.metadata["op_histogram"]["ADD"] = 9  # type: ignore[index]
+
   def test_rejects_bad_magic_version_truncation_and_digest(self):
     blob = bytearray(PublicExecutable(self.metadata, b"payload").encode())
     cases = []

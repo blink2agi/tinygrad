@@ -10,9 +10,9 @@ from dataclasses import replace
 from typing import Any
 import base64, binascii, pickle
 
-from tinygrad.device import Allocator, Buffer, Compiled, CompileError, Compiler, Program, TinyELF
+from tinygrad.device import Allocator, Buffer, Compiled, CompileError, Program, TinyELF
 from tinygrad.helpers import cpu_profile
-from tinygrad.runtime.ops_python import PythonProgram, PythonRenderer
+from tinygrad.runtime.ops_python import PythonCompiler, PythonProgram, PythonRenderer
 from tinygrad.runtime.support.etched import EtchedBuffer, EtchedFormatError, PublicExecutable, PythonEtchedDriver
 from tinygrad.uop.ops import UOp
 
@@ -26,7 +26,7 @@ def _metadata_from_payload(payload:bytes, error_type:type[Exception]=EtchedForma
           "op_histogram": dict(Counter(uop.op.name for uop in uops))}
 
 
-class EtchedCompiler(Compiler):
+class EtchedCompiler(PythonCompiler):
   def compile(self, src:str) -> bytes:
     try: payload = base64.b64decode(src, validate=True)
     except (ValueError, binascii.Error) as exc: raise CompileError(f"Etched renderer output is not valid base64: {exc}") from exc

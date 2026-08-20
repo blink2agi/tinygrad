@@ -5,8 +5,10 @@ information from the unpublished Sohu silicon ABI. It contains no Etched SDK cod
 """
 from __future__ import annotations
 
+from collections.abc import Mapping as ABCMapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Mapping
 import hashlib, hmac, itertools, json, struct, sys, threading
 
@@ -31,8 +33,14 @@ class EtchedPublicSpecIncomplete(RuntimeError):
   """Raised instead of guessing a silicon ABI that Etched has not published."""
 
 
+def _plain_json(value:Any) -> Any:
+  if isinstance(value, ABCMapping): return {key:_plain_json(item) for key,item in value.items()}
+  if isinstance(value, (list, tuple)): return [_plain_json(item) for item in value]
+  return value
+
+
 def _canonical_json(value:Any) -> bytes:
-  try: return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
+  try: return json.dumps(_plain_json(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
   except (TypeError, ValueError) as exc: raise EtchedFormatError(f"value is not canonical JSON: {exc}") from exc
 
 
@@ -135,7 +143,9 @@ class PublicExecutable:
   payload:bytes
 
   def __post_init__(self):
-    object.__setattr__(self, "metadata", _validated_metadata(self.metadata))
+    metadata = _validated_metadata(self.metadata)
+    metadata["op_histogram"] = MappingProxyType(metadata["op_histogram"])
+    object.__setattr__(self, "metadata", MappingProxyType(metadata))
     if not isinstance(self.payload, bytes): raise TypeError("executable payload must be bytes")
     if len(self.payload) > _MAX_PAYLOAD_SIZE: raise EtchedFormatError("executable payload is too large")
 
