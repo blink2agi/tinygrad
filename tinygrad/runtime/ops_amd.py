@@ -7,7 +7,7 @@ from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, H
 from tinygrad.runtime.support.hcq import MMIOInterface, BumpAllocator, hcq_filter_visible_devices, hcq_profile
 from tinygrad.uop.ops import sint
 from tinygrad.device import Compiled, BufferSpec, TinyELF
-from tinygrad.helpers import getenv, round_up, data64_le, DEBUG, PROFILE, ProfileEvent, lo32, hi32, colored, prod, ContextVar, TracingKey
+from tinygrad.helpers import getenv, round_up, data64_le, DEBUG, PROFILE, ProfileEvent, lo32, hi32, colored, prod, ContextVar, TracingKey, from_mv
 from tinygrad.helpers import VIZ, ceildiv, unwrap, pluralize
 from tinygrad.renderer.cstyle import HIPRenderer, HIPCCRenderer
 from tinygrad.renderer.llvmir import AMDLLVMRenderer
@@ -649,6 +649,161 @@ class AMDAllocator(HCQAllocator['AMDDevice']):
 
   def _do_map(self, buf:HCQBuffer): return self.dev.iface.map(buf._base if buf._base is not None else buf)
 
+  def _copyin(self, dest:HCQBuffer, src:memoryview):
+    if not self.dev.is_usb(): return super()._copyin(dest, src)
+    from tinygrad.runtime.support.usb import alloc_cbuffer
+    # Self-synchronizing pipelined USB copyin.
+    #
+    # The host streams 240KB payload chunks to the bridge SRAM over EP 0x02 (the 0xF2 engine), with a 512B
+    # sentinel sector after each 120KB half. The SDMA ring holds, per half-chunk, a POLL packet that spins until
+    # the engine has written that sentinel, then copies it to VRAM -- so the GPU drains each half-chunk as it
+    # lands, the whole copyin needs a single doorbell, and the bulk stream runs back-to-back with no gaps.
+    # The arm for chunk c+1 is issued while chunk c is in flight (the engine latches it), and data is only ever
+    # submitted after its arm is latched (the engine misroutes data arriving unarmed). All other host work
+    # (0xF2 arms, fence polls) is on EP0 and overlaps in-flight bulk transfers.
+    dev, usb = self.dev, self.dev.iface.pci_dev.usb
+    sdq, ts, sdma = dev.sdma_queue(0), dev.timeline_signal, dev.sdma
+    with hcq_profile(self.dev, queue_type=dev.hw_copy_queue_t, desc=TracingKey(f"TINY -> {dev.device}", ret=src.nbytes), enabled=PROFILE,
+                     dev_suff="SDMA:0"):
+      cp_size, src_mv = self.b[0].size - 0x4000, src.cast('B')  # 240KB payload per chunk
+      nchunks = (src.nbytes + cp_size - 1) // cp_size
+      if nchunks == 0: return
+      PART = 0x1E000  # 120KB: sub-chunk split granularity (GPU copies overlap the stream in part units)
+      slots = [(self.b[bi].cpu_view().addr - 0xf000) >> 14 for bi in range(len(self.b))]
+      # fence flags live in the SQ window at PCIe 0x820800+ (E4-readable at xdata 0xA800+); the 0x822000 window
+      # is the engine's completion queue and CQEs clobber it once the queue wraps.
+      # flags[0:2] = full-chunk fences (0xA800/0xA808), flags[2:4] = first-part fences (0xA810/0xA818)
+      flags = [dev.iface.sys_buf.offset(0x800 + bi * 8, 8) for bi in range(2 * len(self.b))]
+      if not hasattr(self, '_usb_seq'):
+        self._usb_seq, self._usb_prev_tail = 0, (0, 0)
+        self._usb_stage = [alloc_cbuffer(0x40000) for _ in range(2)]
+        self._usb_buf_ctr = [0] * len(self.b)  # per-buffer GPU-drain counters (the fence flags)
+        for bi in range(2 * len(self.b)): usb.write(0xA800 + bi * 8, bytes(8))  # clear the GPU-written flag slots
+        # zero both bounce regions once: sentinel polls use EQ semantics and the GPU clears each sentinel it consumes,
+        # so every potential sentinel address must start at zero.
+        for bi in range(len(self.b)): usb.scsi_write(bytes(0x40000), slot_start=slots[bi])
+
+      def next_sent():
+        self._usb_seq = (self._usb_seq + 1) & 0xFFFFFF
+        return 0x51000000 | self._usb_seq
+
+      # Build the whole ring: [wait pre-copyin GPU work] + per chunk, per half: [POLL sentinel][clear][copy half]
+      q = dev.hw_copy_queue_t()
+      q.wait(ts, dev.timeline_value - 1)
+      fences, blens, layouts = [], [], []
+      for c in range(nchunks):
+        bi, lsize = c % len(self.b), min(cp_size, src.nbytes - c * cp_size)
+        parts = []
+        poff, soff = 0, 0  # payload offset within the chunk, stream offset within the bounce buffer
+        fence = dev.timeline_value  # value this chunk's signal will carry (assigned below)
+        self._usb_buf_ctr[bi] += 1
+        ctr = self._usb_buf_ctr[bi]  # fence flag value for this chunk (per-buffer drain counter)
+        while poff < lsize:
+          plen = min(PART, lsize - poff)
+          sval = next_sent()
+          # POLL (func 3 = EQ) until the engine writes the sentinel after this part. Each use carries a fresh
+          # sequence number, so stale values never match and no clearing is needed (regions are zeroed at init).
+          q.q(sdma.SDMA_OP_POLL_REGMEM | sdma.SDMA_PKT_POLL_REGMEM_HEADER_FUNC(3) | sdma.SDMA_PKT_POLL_REGMEM_HEADER_MEM_POLL(1),
+              *data64_le(self.b[bi].va_addr + soff + round_up(plen, 512)), sval, 0xFFFFFFFF,
+              sdma.SDMA_PKT_POLL_REGMEM_DW5_INTERVAL(0x04) | sdma.SDMA_PKT_POLL_REGMEM_DW5_RETRY_COUNT(0xfff))
+          q.copy(dest.offset(c * cp_size + poff), self.b[bi].offset(soff), plen)
+          if poff == 0: q.write(flags[bi + 2], ctr, b64=True)  # first part of this buffer is drained
+          parts.append((poff, plen, soff, sval))
+          soff += round_up(plen, 512) + 512
+          poff += plen
+        q.signal(ts, dev.next_timeline())
+        q.write(flags[bi], ctr, b64=True)
+        self.b_timeline[bi] = fence
+        fences.append(ctr)
+        blens.append(lsize)
+        layouts.append(parts)
+      cmds = array.array('I', q._q).tobytes()
+
+      # Stage the ring in one EP2 write while the engine is disarmed. The GPU ring is circular, dword 0 is a NOP.
+      rb, pv_start = sdq.ring.nbytes, sdq.put_value
+      off = pv_start % rb
+      if off + len(cmds) > rb:  # zero-fill to the ring end and continue at offset 0
+        sdq.ring.view(off, rb - off, fmt='B')[:] = bytes(rb - off)
+        pv_start, off = pv_start + rb - off, 0
+      sdq.ring.view(off, len(cmds), fmt='B')[:] = cmds
+      sdq.put_value = pv_start + len(cmds)
+
+      # Wait for the previous copyin's tail, then kick the GPU once.
+      def flag_val(bi):
+        return int.from_bytes(usb.read(0xA800 + bi * 8, 8), 'little')
+      def flag_passed(bi, ctr):
+        # one E4 read covers both the full-copy and first-part flags of buffer bi
+        d = usb.read(0xA800 + bi * 8, 24)
+        return int.from_bytes(d[0:8], 'little') >= ctr or int.from_bytes(d[16:24], 'little') >= ctr
+      while not flag_passed(self._usb_prev_tail[0], self._usb_prev_tail[1]): pass
+      sdq.write_ptr[0] = sdq.put_value
+      sdq.doorbell[0] = sdq.put_value
+
+      def build_chunk(c):
+        # Stage the wire image: [part][sentinel][part][sentinel]... (no padding; arms cover exact sector counts).
+        sbuf, smv = self._usb_stage[c % len(self._usb_stage)]
+        saddr, sptr = ctypes.addressof(sbuf), ctypes.addressof(from_mv(src_mv[c * cp_size:c * cp_size + blens[c]]))
+        total = 0
+        for poff, plen, soff, sval in layouts[c]:
+          ctypes.memmove(saddr + soff, sptr + poff, plen)
+          struct.pack_into('<I', sbuf, soff + round_up(plen, 512), sval)
+          total = soff + round_up(plen, 512) + 512
+        return smv[:total]
+
+      def submit_chunk(c):
+        return usb.usb.bulk_write_async(build_chunk(c))
+
+      import time as _time
+
+      def chunk_sectors(c):
+        return sum((round_up(plen, 512) + 512) // 512 for _, plen, _, _ in layouts[c])
+
+      def fence_passed(c):
+        return flag_val(c % len(self.b)) >= fences[c]
+
+      bulk_async = usb.usb.bulk_write_async
+
+      # Prime: arm+submit chunk 0, then arm chunk 1 while chunk 0 is in flight and submit it too.
+      usb.scsi_write_arm(chunk_sectors(0) * 512, slot_start=slots[0])
+      pending = [bulk_async(build_chunk(0))]
+      if nchunks > 1:
+        staged_next = build_chunk(1)
+        usb.scsi_write_arm(chunk_sectors(1) * 512, slot_start=slots[1 % len(self.b)])
+        pending.append(bulk_async(staged_next))
+
+      use_f4 = getenv("USB_F4GATE", 1)
+      for c in range(1, nchunks):
+        usb.bulk_wait(pending.pop(0))  # chunk c-1 has landed in SRAM
+        if c + 1 < nchunks:
+          bi = (c + 1) % len(self.b)
+          staged_next = build_chunk(c + 1)  # memcpy overlaps the in-flight chunk (its staging buffer is free)
+          if use_f4:
+            # One blocking control transfer both waits for the GPU fence of chunk c-1's first part and then arms
+            # chunk c+1: the device holds the arm until the fence lands, which is what stops the engine from
+            # streaming into the buffer early (the engine writes buffers sequentially, so a first-part fence
+            # is enough to release the next arm).
+            for _attempt in range(3):
+              resp = usb.scsi_write_arm_f4(chunk_sectors(c + 1) * 512, slot_start=slots[bi], buf_idx=bi, target=fences[c - 1])
+              if ((resp[bi * 8] - fences[c - 1]) & 0xFF) < 0x80 or ((resp[16 + bi * 8] - fences[c - 1]) & 0xFF) < 0x80: break
+            else: raise RuntimeError(f"0xF4 arm bailed waiting for GPU fence {fences[c-1]}, flags {resp.hex()}")
+          else:
+            usb.scsi_write_arm(chunk_sectors(c + 1) * 512, slot_start=slots[bi])
+          pending.append(bulk_async(staged_next))
+          if not use_f4:
+            # E4-read gate: buffer for chunk c+1 is only reused after the GPU copied chunk c-1's first part.
+            _t0 = _time.monotonic()
+            for _ in range(100000):
+              if flag_passed(bi, fences[c - 1]): break
+              if _time.monotonic() - _t0 < 0.0003: _time.sleep(0.0001)
+            else: raise RuntimeError("USB copyin GPU fence timeout")
+
+      usb.bulk_wait(pending.pop(0))
+      self._usb_prev_tail = ((nchunks - 1) % len(self.b), fences[-1])
+      # Drain the GPU: make sure the last chunk has been copied before returning.
+      for _ in range(100000):
+        if fence_passed(nchunks - 1): break
+      else: raise RuntimeError("USB copyin GPU drain timeout")
+
   def _copyout(self, dest:memoryview, src:HCQBuffer):
     if not self.dev.is_usb(): return super()._copyout(dest, src)
     self.dev.synchronize()
@@ -916,7 +1071,10 @@ class USBIface(PCIIface):
     self._compute_props()
 
     # special regions
-    self.copy_bufs = [self._dma_region(ctrl_addr=0xf000, sys_addr=0x200000, size=0x80000)]
+    # Two 256KB SRAM bounce buffers (16 slots each), so USB bulk IN flight for chunk i overlaps the SDMA of chunk i-1.
+    # ctrl_addr tags encode the 16KB slot base for the 0xF2 engine: 0xf000 -> slot 0, 0x4f000 -> slot 16.
+    self.copy_bufs = [self._dma_region(ctrl_addr=0xf000, sys_addr=0x200000, size=0x40000),
+                      self._dma_region(ctrl_addr=0x4f000, sys_addr=0x240000, size=0x40000)]
     self.sys_buf, self.sys_next_off = self._dma_region(ctrl_addr=0xa000, sys_addr=0x820000, size=0x1000), 0x200
     self.cq_buf = self._dma_region(ctrl_addr=0xb800, sys_addr=0x822000, size=0x1000)
 
@@ -926,9 +1084,8 @@ class USBIface(PCIIface):
 
   def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, **kwargs) -> HCQBuffer:
     # usb allocates uncached and cpu_access in vram. vram writes are faster than sram writes
-    if host and self.sys_next_off + size < self.sys_buf.size:
-      self.sys_next_off += size
-      return self.sys_buf.offset(self.sys_next_off - size, size)
+    # NOTE: host allocs deliberately do NOT use sys_buf (the 0x820000 NVMe SQ region): the GPU's signal writes there
+    # collide with the 0xF2 engine mid-stream. Signals in VRAM are read back via 0xF0 streaming reads instead.
 
     # force devmem
     return super().alloc(size, host=False, uncached=uncached, cpu_access=cpu_access, contiguous=contiguous, force_devmem=True, **kwargs)
@@ -1048,7 +1205,8 @@ class AMDDevice(HCQCompiled):
     if getenv("AMD_DISABLE_SDMA"): return None
     if idx in self.sdma_queues: return self.sdma_queues[idx]
     with contextlib.suppress(OSError):
-      self.sdma_queues[idx] = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 0x200 if self.is_usb() else (16 << 20), idx=idx)
+      # USB: 1MB ring, so a full copyin can be staged in one write. GPU rings are circular and dword 0 is an SDMA NOP.
+      self.sdma_queues[idx] = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, (1 << 20) if self.is_usb() else (16 << 20), idx=idx)
     return self.sdma_queues.get(idx, None)
 
   def _ensure_has_local_memory(self, private_segment_size):
