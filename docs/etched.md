@@ -9,7 +9,7 @@ The portable reference path is complete and tested. This project does not claim 
 From this repository:
 
 ```sh
-DEV=ETCHED python3 examples/etched_demo.py
+PYTHONPATH=. DEV=ETCHED python3 examples/etched_demo.py
 ```
 
 The demo performs a rectangular matrix multiplication through Tinygrad's normal scheduler, Etched renderer, executable envelope, allocator, Python submission queue, and completion path. It prints the result and queue evidence.
