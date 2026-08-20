@@ -1,4 +1,4 @@
-import pickle, unittest
+import json, os, pickle, subprocess, sys, textwrap, unittest
 
 from tinygrad.device import ALL_DEVICES, Device, TinyELF
 from tinygrad.helpers import Target
@@ -68,6 +68,41 @@ class TestEtchedDevice(unittest.TestCase):
     self.assertIn("ETCHED", ALL_DEVICES)
     self.assertIsInstance(Device["ETCHED"], EtchedDevice)
     self.assertEqual(Device["ETCHED"].renderer.target.device, "ETCHED")
+
+
+class TestEtchedTensorEndToEnd(unittest.TestCase):
+  def test_tensor_math_and_driver_trace_in_clean_process(self):
+    script = textwrap.dedent("""
+      import json
+      from tinygrad import Device, Tensor
+
+      a = Tensor([1.0, -2.0, 3.0], device="ETCHED")
+      b = Tensor([4.0, 5.0, -6.0], device="ETCHED")
+      vector = ((a + b) * 2).realize().tolist()
+      reduction = (a * b).sum().item()
+      left = Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], device="ETCHED")
+      right = Tensor([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]], device="ETCHED")
+      matmul = (left @ right).realize().tolist()
+      fused = ((a * 3) + 2).relu().realize().tolist()
+
+      driver = Device["ETCHED"].driver
+      print(json.dumps({"vector": vector, "reduction": reduction, "matmul": matmul, "fused": fused,
+                        "submissions": len(driver.submissions), "completions": len(driver.completions),
+                        "all_ok": all(completion.ok for completion in driver.completions),
+                        "trace_kinds": sorted(set(event.kind for event in driver.trace))}))
+    """)
+    process = subprocess.run([sys.executable, "-c", script], cwd=os.getcwd(), env=os.environ | {"DEV": "ETCHED"},
+                             text=True, capture_output=True, check=False)
+    self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+    result = json.loads(process.stdout.strip().splitlines()[-1])
+    self.assertEqual(result["vector"], [10.0, 6.0, -6.0])
+    self.assertEqual(result["reduction"], -24.0)
+    self.assertEqual(result["matmul"], [[58.0, 64.0], [139.0, 154.0]])
+    self.assertEqual(result["fused"], [5.0, 0.0, 11.0])
+    self.assertGreaterEqual(result["submissions"], 4)
+    self.assertEqual(result["completions"], result["submissions"])
+    self.assertTrue(result["all_ok"])
+    self.assertEqual(result["trace_kinds"], ["complete", "submit"])
 
 
 if __name__ == "__main__": unittest.main()
