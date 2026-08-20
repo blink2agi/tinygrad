@@ -37,8 +37,9 @@ class USB3:
     self._ctrl_buf, self._ctrl_mv = alloc_cbuffer(0x1000)
     # async bulk OUT state: tag -> (transfer ptr, keepalive memoryview)
     self._async_seq = itertools.count(1)
-    self._async_pending: dict[int, tuple] = {}
-    self._async_free: list = []
+    self._async_pending: dict[int, tuple[c.POINTER[libusb.struct_libusb_transfer], memoryview]] = {}
+    self._async_free: list[c.POINTER[libusb.struct_libusb_transfer]] = []
+    self._async_err = 0
     self._async_cb = libusb.libusb_transfer_cb_fn(self._on_bulk_done)
 
     self.handle = c.init_c_var(c.POINTER[libusb.struct_libusb_device_handle], lambda x: checked(libusb.libusb_open)(dev, x))
@@ -79,9 +80,9 @@ class USB3:
     assert self._transferred.value == len(payload), f"bulk OUT short write: {self._transferred.value}/{len(payload)} bytes"
 
   def _on_bulk_done(self, xfer):
+    # NOTE: runs inside libusb event handling; exceptions here are unraisable, so latch errors for bulk_wait.
+    if xfer.contents.status != 0 or xfer.contents.actual_length != xfer.contents.length: self._async_err = xfer.contents.status or -1
     self._async_pending.pop(int(xfer.contents.user_data or 0), None)
-    assert xfer.contents.status == 0, f"async bulk OUT failed: status={xfer.contents.status}"
-    assert xfer.contents.actual_length == xfer.contents.length, f"async bulk OUT short: {xfer.contents.actual_length}/{xfer.contents.length}"
     self._async_free.append(xfer)  # transfers are reused (re-submit is cheaper than alloc/free)
 
   def bulk_write_async(self, payload:memoryview, timeout:int=10000) -> int:
@@ -99,6 +100,7 @@ class USB3:
 
   def bulk_wait(self, tag:int):
     while tag in self._async_pending: checked(libusb.libusb_handle_events)(None)
+    if self._async_err: raise RuntimeError(f"async bulk OUT failed: status={self._async_err}")
 
   def bulk_read(self, length:int, timeout:int=1000) -> memoryview:
     if length > len(self._bulk_mv): self._bulk_buf, self._bulk_mv = alloc_cbuffer(length)
