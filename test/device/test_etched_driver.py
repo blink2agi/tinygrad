@@ -1,6 +1,8 @@
 import hashlib, json, struct, unittest
 
-from tinygrad.runtime.support.etched import EtchedFormatError, PublicExecutable, PublicMatmulIR
+from tinygrad.runtime.support.etched import (
+  EtchedFormatError, PublicExecutable, PublicMatmulIR, PythonEtchedDriver,
+)
 
 
 class TestPublicMatmulIR(unittest.TestCase):
@@ -77,6 +79,92 @@ class TestPublicExecutable(unittest.TestCase):
     blob = header + metadata + payload
     with self.assertRaisesRegex(EtchedFormatError, "canonical"):
       PublicExecutable.decode(blob)
+
+
+def reference_executable(payload:bytes=b"lowered-uops") -> PublicExecutable:
+  return PublicExecutable({"format": "etched-public-executable", "op_histogram": {"STORE": 1}, "public_ir_version": 1,
+                           "uop_count": 1, "version": 1}, payload)
+
+
+class TestPythonEtchedMemory(unittest.TestCase):
+  def test_aligned_monotonic_allocations_and_copies(self):
+    driver = PythonEtchedDriver()
+    first, second = driver.allocate(3), driver.allocate(5)
+    self.assertEqual(first.address % 64, 0)
+    self.assertEqual(second.address % 64, 0)
+    self.assertGreaterEqual(second.address - first.address, 64)
+
+    driver.copyin(first, memoryview(b"abc"))
+    result = bytearray(3)
+    driver.copyout(memoryview(result), first)
+    self.assertEqual(result, b"abc")
+
+  def test_bounded_views_share_the_allocation(self):
+    driver = PythonEtchedDriver()
+    base = driver.allocate(6)
+    driver.copyin(base, memoryview(b"abcdef"))
+    view = driver.view(base, 2, 3)
+    self.assertEqual((view.address, view.size), (base.address + 2, 3))
+    driver.copyin(view, memoryview(b"XYZ"))
+    self.assertEqual(bytes(driver.as_memoryview(base)), b"abXYZf")
+
+    for offset, size in [(-1, 1), (0, 0), (6, 1), (4, 3)]:
+      with self.subTest(offset=offset, size=size), self.assertRaises(ValueError):
+        driver.view(base, offset, size)
+
+  def test_rejects_invalid_size_copy_and_ownership(self):
+    driver, other = PythonEtchedDriver(), PythonEtchedDriver()
+    with self.assertRaises(ValueError): driver.allocate(0)
+    buf = driver.allocate(3)
+    with self.assertRaisesRegex(ValueError, "copy size"):
+      driver.copyin(buf, memoryview(b"xx"))
+    with self.assertRaisesRegex(ValueError, "copy size"):
+      driver.copyout(memoryview(bytearray(2)), buf)
+    with self.assertRaisesRegex(ValueError, "different driver"):
+      other.as_memoryview(buf)
+
+  def test_free_rejects_views_and_use_after_free(self):
+    driver = PythonEtchedDriver()
+    buf = driver.allocate(4)
+    with self.assertRaisesRegex(ValueError, "base allocation"):
+      driver.free(driver.view(buf, 1, 2))
+    driver.free(buf)
+    with self.assertRaisesRegex(RuntimeError, "freed"):
+      driver.as_memoryview(buf)
+    with self.assertRaisesRegex(RuntimeError, "freed"):
+      driver.free(buf)
+
+
+class TestPythonEtchedQueue(unittest.TestCase):
+  def test_submission_completion_order_and_trace(self):
+    driver = PythonEtchedDriver()
+    first = driver.submit(reference_executable(b"one"), lambda: "first-result")
+    second = driver.submit(reference_executable(b"two"), lambda: 22)
+    self.assertEqual((first.sequence, first.ok, first.result, first.error), (1, True, "first-result", None))
+    self.assertEqual((second.sequence, second.ok, second.result, second.error), (2, True, 22, None))
+    self.assertEqual([x.sequence for x in driver.submissions], [1, 2])
+    self.assertEqual([x.sequence for x in driver.completions], [1, 2])
+    self.assertEqual([(x.kind, x.sequence) for x in driver.trace], [("submit", 1), ("complete", 1), ("submit", 2), ("complete", 2)])
+    self.assertEqual(driver.synchronize(), 2)
+    self.assertIsInstance(driver.submissions, tuple)
+
+  def test_failure_is_completed_and_reraised(self):
+    driver = PythonEtchedDriver()
+
+    def fail(): raise RuntimeError("device exploded")
+
+    with self.assertRaisesRegex(RuntimeError, "device exploded"):
+      driver.submit(reference_executable(), fail)
+    self.assertEqual(len(driver.completions), 1)
+    self.assertFalse(driver.completions[0].ok)
+    self.assertEqual(driver.completions[0].error, "RuntimeError: device exploded")
+    self.assertEqual([(x.kind, x.sequence) for x in driver.trace], [("submit", 1), ("error", 1)])
+    self.assertEqual(driver.synchronize(), 1)
+
+  def test_rejects_non_executable_and_non_callable(self):
+    driver = PythonEtchedDriver()
+    with self.assertRaises(TypeError): driver.submit(b"not-an-executable", lambda: None)  # type: ignore[arg-type]
+    with self.assertRaises(TypeError): driver.submit(reference_executable(), None)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__": unittest.main()
