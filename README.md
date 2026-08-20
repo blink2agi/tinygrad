@@ -107,6 +107,7 @@ tinygrad already supports numerous accelerators, including:
 - [x] [AMD](tinygrad/runtime/ops_amd.py)
 - [x] [NV](tinygrad/runtime/ops_nv.py)
 - [x] [QCOM](tinygrad/runtime/ops_qcom.py)
+- [x] [Etched public reference backend](docs/etched.md) (maintained fork; physical Sohu ABI pending vendor disclosure)
 - [x] [WEBGPU](tinygrad/runtime/ops_webgpu.py)
 
 And it is easy to add more! Your accelerator of choice only needs to support a total of ~25 low level ops.
